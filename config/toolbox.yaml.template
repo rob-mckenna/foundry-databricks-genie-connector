@@ -1,0 +1,4 @@
+description: Azure Databricks Genie tools exposed through a managed Foundry Toolbox.
+connections:
+  - name: ${FOUNDRY_CONNECTION_NAME}
+
