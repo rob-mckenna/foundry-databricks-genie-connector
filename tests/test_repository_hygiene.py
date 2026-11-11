@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -16,13 +17,21 @@ TEXT_SUFFIXES = {
     ".toml",
     ".yaml",
     ".yml",
+    ".template",
 }
 
 
 class RepositoryHygieneTests(unittest.TestCase):
     def _repository_text(self) -> str:
         chunks: list[str] = []
-        for path in ROOT.rglob("*"):
+        tracked = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+            cwd=ROOT, check=True, capture_output=True
+        ).stdout.decode("utf-8").split("\0")
+        for relative in tracked:
+            if not relative:
+                continue
+            path = ROOT / relative
             if not path.is_file():
                 continue
             if any(part in {".git", ".generated", "__pycache__"} for part in path.parts):
@@ -46,7 +55,25 @@ class RepositoryHygieneTests(unittest.TestCase):
             self.assertIsNone(re.search(pattern, text), pattern)
 
     def test_no_local_environment_file_is_tracked(self) -> None:
-        self.assertFalse((ROOT / ".env").exists())
+        result = subprocess.run(
+            ["git", "ls-files", "-z"], cwd=ROOT, check=True, capture_output=True
+        )
+        tracked = result.stdout.decode("utf-8").split("\0")
+        forbidden = [
+            name for name in tracked
+            if Path(name).name == ".env"
+            or (Path(name).name.startswith(".env.") and Path(name).name != ".env.example")
+            or name.startswith(".generated/")
+        ]
+        self.assertEqual(forbidden, [], "Local configuration or generated state is tracked.")
+
+    def test_local_configuration_is_ignored(self) -> None:
+        result = subprocess.run(
+            ["git", "check-ignore", "--no-index", ".env", ".env.local",
+             ".generated/toolbox.yaml"],
+            cwd=ROOT, check=True, capture_output=True, text=True,
+        )
+        self.assertEqual(len(result.stdout.splitlines()), 3)
 
     def test_examples_use_placeholders(self) -> None:
         example = (ROOT / ".env.example").read_text(encoding="utf-8")

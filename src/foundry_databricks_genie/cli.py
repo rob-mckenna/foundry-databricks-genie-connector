@@ -1,14 +1,21 @@
-"""Offline configuration commands used by the setup scripts."""
+"""Offline configuration commands and explicit Foundry resource setup."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sys
 from pathlib import Path
 
-from .config import ConfigurationError, load_configuration
+from .config import ConfigurationError, load_bootstrap_configuration, load_configuration, load_test_agent_name
+from .setup import (
+    assert_connection,
+    assert_toolbox_connections,
+    parse_json,
+    preflight,
+    setup,
+    write_toolbox,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -34,87 +41,51 @@ def _parser() -> argparse.ArgumentParser:
     toolbox.add_argument("--input", required=True)
     toolbox.add_argument("--expected-name", required=True)
 
+    provision = subparsers.add_parser("setup")
+    provision.add_argument("--env-file", default=".env")
+    provision.add_argument("--output", default=".generated/toolbox.yaml")
+    provision.add_argument("--replace-connection", action="store_true")
+
+    bootstrap = subparsers.add_parser(
+        "bootstrap", help="Plan or apply dedicated test-agent setup; optionally run a smoke test."
+    )
+    bootstrap.add_argument("--env-file", default=".env")
+    bootstrap.add_argument("--output", default=".generated/toolbox.yaml")
+    bootstrap.add_argument("--apply", action="store_true")
+    bootstrap.add_argument("--question-file")
+    bootstrap.add_argument("--approve-tools", action="store_true")
+    bootstrap.add_argument("--non-interactive", action="store_true")
+
+    test_agent = subparsers.add_parser(
+        "test-agent", help="Inspect and invoke an existing agent without provisioning."
+    )
+    test_agent.add_argument("--env-file", default=".env")
+    test_agent.add_argument("--question-file", required=True)
+    test_agent.add_argument("--approve-tools", action="store_true")
+    test_agent.add_argument("--non-interactive", action="store_true")
+
     subparsers.add_parser("preflight")
     return parser
 
 
-def _render_toolbox(connection_name: str) -> str:
-    return (
-        "description: Azure Databricks Genie tools exposed through a managed "
-        "Foundry Toolbox.\n"
-        "connections:\n"
-        f"  - name: {connection_name}\n"
-    )
-
-
-def _normalized_key(key: str) -> str:
-    return "".join(character for character in key.lower() if character.isalnum())
-
-
-def _values_for_keys(value: object, accepted_keys: set[str]) -> list[str]:
-    matches: list[str] = []
-    if isinstance(value, dict):
-        for key, child in value.items():
-            if _normalized_key(str(key)) in accepted_keys and isinstance(child, str):
-                matches.append(child)
-            matches.extend(_values_for_keys(child, accepted_keys))
-    elif isinstance(value, list):
-        for child in value:
-            matches.extend(_values_for_keys(child, accepted_keys))
-    return matches
-
-
 def _load_json(path: str) -> object:
     try:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ConfigurationError(f"Could not read JSON from {path}: {error}") from error
-
-
-def _assert_connection(path: str, expected_name: str, expected_target: str) -> None:
-    document = _load_json(path)
-    names = _values_for_keys(document, {"name", "connectionname"})
-    targets = _values_for_keys(document, {"target", "targeturl", "serverurl"})
-
-    if names and expected_name not in names:
-        raise ConfigurationError(
-            "The existing project connection name does not match the configuration."
-        )
-    normalized_target = expected_target.rstrip("/")
-    if normalized_target not in {target.rstrip("/") for target in targets}:
-        raise ConfigurationError(
-            "The existing project connection targets a different MCP endpoint. "
-            "Use the explicit replace option after confirming the resource."
-        )
-
-
-def _assert_toolbox_connections(path: str, expected_name: str) -> None:
-    document = _load_json(path)
-    names = _values_for_keys(document, {"name", "connectionname"})
-    if expected_name not in names:
-        raise ConfigurationError(
-            "The existing Toolbox does not reference the configured project "
-            "connection. Choose a different Toolbox name or reconcile it manually."
-        )
+        return parse_json(Path(path).read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError) as error:
+        raise ConfigurationError("Could not read the JSON input file.") from error
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "preflight":
-            missing = [
-                command for command in ("python", "azd") if shutil.which(command) is None
-            ]
-            if missing:
-                raise ConfigurationError(
-                    "Missing required command(s): " + ", ".join(missing)
-                )
+            preflight()
             print("Required local commands are available.")
             return 0
 
         if args.command == "assert-connection":
-            _assert_connection(
-                args.input,
+            assert_connection(
+                _load_json(args.input),
                 args.expected_name,
                 args.expected_target,
             )
@@ -122,7 +93,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "assert-toolbox-connections":
-            _assert_toolbox_connections(args.input, args.expected_name)
+            assert_toolbox_connections(_load_json(args.input), args.expected_name)
             print("Existing Toolbox references the configured connection.")
             return 0
 
@@ -136,16 +107,46 @@ def main(argv: list[str] | None = None) -> int:
             print(configuration.genie_mcp_endpoint)
         elif args.command == "render-toolbox":
             output = Path(args.output)
-            output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text(
-                _render_toolbox(configuration.foundry_connection_name),
-                encoding="utf-8",
-            )
+            write_toolbox(output, configuration.foundry_connection_name)
             print(f"Rendered Toolbox configuration: {output}")
+        elif args.command == "setup":
+            setup(
+                configuration, Path(args.output),
+                replace_connection=args.replace_connection,
+            )
+        elif args.command == "test-agent":
+            from .agent_test import execute_agent_test
+            from .smoke import read_question
+
+            agent_name = load_test_agent_name(args.env_file, configuration)
+            question = read_question(Path(args.question_file))
+            return execute_agent_test(
+                configuration, agent_name, question,
+                approve_tools=args.approve_tools, non_interactive=args.non_interactive,
+            )
+        elif args.command == "bootstrap":
+            from .bootstrap import execute_bootstrap, print_plan
+            from .smoke import read_question
+
+            settings = load_bootstrap_configuration(args.env_file, configuration)
+            question = read_question(Path(args.question_file)) if args.question_file else None
+            if args.approve_tools and question is None:
+                raise ConfigurationError("--approve-tools requires --question-file.")
+            print_plan(configuration, settings)
+            if not args.apply:
+                print("PLAN ONLY: no cloud calls or file writes. Add --apply to execute.")
+                return 0
+            return execute_bootstrap(
+                configuration, settings, Path(args.output), question,
+                approve_tools=args.approve_tools, non_interactive=args.non_interactive,
+            )
         return 0
     except ConfigurationError as error:
         print(f"Configuration error: {error}", file=sys.stderr)
         return 2
+    except KeyboardInterrupt:
+        print("Interrupted. Inspect resource/query state before retrying.", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

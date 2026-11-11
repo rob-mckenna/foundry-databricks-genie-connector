@@ -12,6 +12,12 @@ license = { text = "MIT" }
 authors = [{ name = "Contributors" }]
 dependencies = []
 
+[project.optional-dependencies]
+bootstrap = [
+    "azure-ai-projects>=2.7.0,<3",
+    "azure-identity>=1.26.0,<2",
+]
+
 [project.scripts]
 foundry-databricks-genie = "foundry_databricks_genie.cli:main"
 

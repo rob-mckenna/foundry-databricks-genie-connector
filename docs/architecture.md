@@ -1,58 +1,161 @@
-# Architecture
+# Architecture and modernization decisions
 
-## Design goals
+Documentation reviewed on **2026-10-30**. Product documentation is the authority;
+offline tests establish repository behavior, not cloud service compatibility.
 
-- Work with any Microsoft Foundry project, Databricks workspace, and Genie
-  Agent.
-- Keep authentication in a Foundry project connection instead of agent code.
-- Reuse the connection through an immutable, versioned Foundry Toolbox.
-- Preserve Unity Catalog authorization through user OAuth identity.
-- Avoid customer data, credentials, and environment identifiers in Git.
+## Before and after
 
-## Components
+Previously, the only route was a Foundry Toolbox referencing a
+`foundrydatabricksmcp` managed OAuth connection targeting
+`https://<workspace>/api/2.0/mcp/genie/<space-id>`.
+The Python package validated configuration; two shell scripts duplicated the
+provisioning flow. Authorization was described broadly as user OAuth plus
+Genie/Unity Catalog access.
 
-### Databricks managed Genie MCP server
-
-Each Genie Agent exposes a managed MCP endpoint:
+That route remains documented and useful. The modernization adds Genie One
+without removing or silently repointing the curated route:
 
 ```text
-https://<workspace-host>/api/2.0/mcp/genie/<genie-space-id>
+                  Microsoft Foundry project
+  Agent A -----+
+  Agent B -----+--> Toolbox --> OAuth connection for the selected target
+                                  |
+              +-------------------+---------------------+
+              |                                         |
+     Mode: genie-one                           Mode: genie-agent
+     Unity Gateway                             Workspace managed MCP
+     system.ai.genie_one_mcp                    /api/2.0/mcp/genie/<space-id>
+     Genie One / Genie Ontology                Selected Genie Agent
+              |                                         |
+     Gateway grants/policies                   Genie Agent ACLs
+              |                                         |
+              +---- Underlying resource permissions ----+
+                         Unity Catalog data
 ```
 
-Databricks hosts the MCP server. The Genie Agent and Unity Catalog determine
-which governed data the signed-in user can access.
+Each deployed Toolbox/connection pair selects one mode and target. Deploy
+another pair with distinct names if both are needed. Multiple agents may
+reuse a pair; there is no assumption that one connection targets two servers.
 
-### Foundry project connection
+## Discovery assessment
 
-The setup creates a `remote-tool` connection with:
+| Area | Decision |
+| --- | --- |
+| Reusable Toolbox/project connection | Retain; Microsoft explicitly documents reuse across agents and runtimes |
+| Managed Databricks OAuth connector | Retain for curated Genie Agent; Genie One scope compatibility is unverified |
+| Existing space-specific MCP URL | Retain as `genie-agent`; no EOL was established for this endpoint |
+| Genie One | Add the documented Gateway service, workspace query parameter, and separate scope requirements |
+| Local configuration | Retain non-secret environment pattern and override precedence |
+| Provisioning | Share one Python `azd` routine behind the two existing shell entry points |
+| Error handling | Stop on failed/malformed/incomplete lookups; do not infer absence or print raw CLI payloads |
+| Existing-resource assertions | Match explicit resource fields, OAuth type and target; inspect scopes when exposed |
+| Documentation | Replace blanket lifecycle claims; distinguish compute, data and Gateway permissions |
+| Tests | Preserve original endpoint coverage; add modes, setup paths, failures and hygiene regression tests |
 
-- authentication type: `oauth2`;
-- managed connector: `foundrydatabricksmcp`;
-- target: the selected Genie MCP endpoint.
+The base connector introduces no model, agent application, custom MCP proxy,
+token cache, cloud SDK dependency or infrastructure.
 
-The project connection centralizes OAuth state and avoids embedding
-authorization headers in an agent definition.
+The optional [guided bootstrap](bootstrap.md) adds an SDK dependency extra and
+creates a dedicated declarative prompt agent. Its MCP tool references a second
+project connection, using `UserEntraToken` with audience `https://ai.azure.com`,
+to authenticate to a pinned Toolbox endpoint. The original Databricks OAuth
+connection remains downstream of the Toolbox. No model deployment, hosted
+agent container, custom OAuth registration or permission grant is created.
+The SDK binds smoke tests to the agent's current endpoint and verifies active
+version routing before and after the test.
 
-### Foundry Toolbox
+## Mode contracts
 
-The Toolbox references the project connection by name. It provides a reusable,
-versioned MCP endpoint that can be attached to multiple agents without
-duplicating connection configuration.
+### Genie One
 
-## Trust boundaries
+```text
+https://<workspace-hostname>/ai-gateway/mcp-services/system.ai.genie_one_mcp?o=<workspace-id>
+```
 
-Prompts and tool arguments cross from Foundry into Azure Databricks. Responses
-cross back into Foundry. Databricks permissions remain authoritative for data
-access. Repository configuration contains resource locations but no secrets.
+The service-specific documentation includes the `o` query parameter; the
+implementation follows that more specific contract rather than the generic
+Gateway URL example. Workspace ID is explicitly configured, not inferred from
+a hostname. A Genie space ID is not meaningful in this mode.
 
-## Deliberate exclusions
+Genie One answers workspace-wide business questions using Genie Ontology.
+`genie_ask` starts a response, `genie_poll_response` follows it to completion,
+and `genie_get_query_result` retrieves larger results when needed. Responses
+can still be truncated. Conversation continuation uses `conversation_id`.
+Do not overlap polls. Cancellation uses `genie_cancel_response`. MCP Apps
+clients can receive `view_ask`; rendering those views in Foundry is not
+verified here. The connector itself does not implement agent orchestration.
 
-The repository does not:
+### Curated Genie Agent
 
-- provision Azure or Databricks resources;
-- create or configure a Genie Agent;
-- grant Unity Catalog permissions;
-- automate interactive user consent;
-- use short-lived bearer tokens as a deployment mechanism;
-- modify an existing Toolbox version.
+```text
+https://<workspace-hostname>/api/2.0/mcp/genie/<space-id>
+```
 
+This route uses a selected Genie Agent's tables, instructions and examples
+(up to 50 tables/views/metric views per the current documentation). It is
+read-only and does not pass conversation history to the Genie API.
+Calls bypass Unity Gateway tracing, MCP grants, policies and guardrails.
+
+## OAuth boundary
+
+Both routes retain per-user OAuth project connections. `managed-oauth` uses
+Foundry's app; `existing-oauth` normally uses a custom Databricks OAuth app
+whose tokens are still managed by Foundry.
+
+Microsoft lists `foundrydatabricksmcp` but does not establish its
+`ai-gateway` scope support in the sources reviewed. Managed connectors supply
+their own scopes: do not add custom scope/client flags to a managed connection.
+Accordingly, Genie One setup requires an existing OAuth connection and never
+creates/replaces a managed connector.
+
+No claim is made that a Microsoft Entra access token for Foundry can be
+forwarded to Databricks. Provider OAuth sign-in, Entra user delegation, and
+Databricks-hosted-agent OBO are distinct mechanisms. See
+[authentication](custom-oauth.md) and [security](security.md).
+
+## Reuse, versions and user context
+
+Toolbox definitions reference project connection names, not credentials.
+The consumer endpoint serves the default Toolbox version:
+
+```text
+<project-endpoint>/toolboxes/<toolbox-name>/mcp?api-version=v1
+```
+
+Test a candidate version before promotion:
+
+```text
+<project-endpoint>/toolboxes/<toolbox-name>/versions/<version>/mcp?api-version=v1
+```
+
+This setup does not modify existing Toolbox versions or promote defaults.
+Replacing a connection is not isolated by a Toolbox version: all references
+to that connection can be affected. Prefer new names when migrating.
+
+Foundry documents OAuth consent per user, connection name and project.
+Agent identity gates Toolbox access; the provider-authorized user determines
+Databricks data access. For hosted agents, an agent credential alone does not
+carry the user's context. Use the supported Foundry hosting integration to
+forward the current `x-agent-foundry-call-id`; never hard-code or reuse it
+between requests. Cross-agent reuse and concurrent-user isolation still need
+[live testing](validation.md).
+
+## Lifecycle and authoritative source register
+
+| Component | Verified statement / limitation | Source |
+| --- | --- | --- |
+| Genie One MCP | GA service `system.ai.genie_one_mcp` | [Genie One](https://learn.microsoft.com/azure/databricks/agents/mcp-tools/genie-mcp) |
+| Unsuffixed Genie One beta URL | `/api/2.0/mcp/genie` is deprecated; EOL November 30, 2026 | [Genie One migration notice](https://learn.microsoft.com/azure/databricks/agents/mcp-tools/genie-mcp#access-through-unity-gateway) |
+| Curated Genie Agent MCP | Public Preview; space-specific endpoint remains documented | [Genie Agent MCP](https://learn.microsoft.com/azure/databricks/agents/mcp-tools/genie-agent) |
+| Databricks MCP / Unity Gateway | Status is capability-specific; other `system.ai` services require Gateway beta enablement; do not transfer that requirement to GA Genie One | [Databricks-provided MCPs](https://learn.microsoft.com/azure/databricks/agents/mcp-tools/built-in-mcp-services) |
+| Foundry Toolbox | Reusable managed endpoint and connection references documented; a separate blanket GA declaration was not established here | [Overview](https://learn.microsoft.com/azure/foundry/agents/concepts/toolbox-overview), [setup/versioning](https://learn.microsoft.com/azure/foundry/agents/how-to/tools/toolbox) |
+| Foundry MCP / managed OAuth | Supported configuration and Databricks connector are documented; no independent end-to-end GA or Genie One compatibility claim | [MCP configuration](https://learn.microsoft.com/azure/foundry/agents/how-to/tools/model-context-protocol) |
+| Foundry OAuth | Per-user consent, managed/custom applications and refresh | [MCP authentication](https://learn.microsoft.com/azure/foundry/agents/how-to/mcp-authentication), [Toolbox identity boundary](https://learn.microsoft.com/azure/foundry/agents/how-to/tools/tool-authentication) |
+| Databricks OAuth | Gateway scope, preconfigured clients, Streamable HTTP and refresh | [Other MCP clients](https://learn.microsoft.com/azure/databricks/ai-gateway/coding-agent-mcp-skills#other-mcp-clients), [OAuth applications](https://learn.microsoft.com/azure/databricks/integrations/enable-disable-oauth) |
+| Gateway authorization | Service/parent grants, workspace assignment, inherited grants | [Govern an MCP](https://learn.microsoft.com/azure/databricks/ai-gateway/govern-mcp-service) |
+| Curated authorization | Embedded compute credentials versus end-user data access | [Share a Genie Agent](https://learn.microsoft.com/azure/databricks/genie-agents/set-up#share-a-genie-agent) |
+
+Key remaining risks are managed-connector scope support, deployed CLI response
+compatibility, user-context propagation, network reachability, feature/region
+availability, and revoked/expired consent. They require explicit validation,
+not additional speculative code.

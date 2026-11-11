@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import contextlib
+import io
 import os
 import tempfile
 import unittest
@@ -49,6 +51,123 @@ class ConfigurationTests(unittest.TestCase):
             configuration = load_configuration(self.env_file)
 
         self.assertEqual(configuration.databricks_genie_space_id, "environment-space")
+
+    def test_legacy_defaults_preserve_public_fields_and_endpoint(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            configuration = load_configuration(self.env_file)
+        self.assertEqual(configuration.databricks_integration_mode, "genie-agent")
+        self.assertEqual(configuration.foundry_connection_mode, "managed-oauth")
+        self.assertEqual(configuration.required_oauth_scopes, ("genie", "offline_access"))
+        self.assertEqual(
+            configuration.toolbox_mcp_endpoint,
+            "https://example.services.ai.azure.com/api/projects/demo/"
+            "toolboxes/databricks-genie-toolbox/mcp?api-version=v1",
+        )
+
+    def test_genie_one_endpoint_includes_exact_service_and_workspace_query(self) -> None:
+        self.env_file.write_text(
+            VALID_ENV.replace("DATABRICKS_GENIE_SPACE_ID=space_123-abc\n", "")
+            + "DATABRICKS_INTEGRATION_MODE=genie-one\n"
+            + "DATABRICKS_WORKSPACE_ID=1234567890123456\n"
+            + "FOUNDRY_CONNECTION_MODE=existing-oauth\n",
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            configuration = load_configuration(self.env_file)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = main(["endpoint", "--env-file", str(self.env_file)])
+        expected = (
+            "https://example.azuredatabricks.net/ai-gateway/mcp-services/"
+            "system.ai.genie_one_mcp?o=1234567890123456"
+        )
+        self.assertEqual(configuration.genie_mcp_endpoint, expected)
+        self.assertEqual(configuration.required_oauth_scopes, ("ai-gateway", "offline_access"))
+        self.assertEqual(configuration.databricks_genie_space_id, "")
+        self.assertEqual(output.getvalue().strip(), expected)
+        self.assertEqual(result, 0)
+
+    def test_new_environment_settings_override_file(self) -> None:
+        with patch.dict(os.environ, {
+            "DATABRICKS_INTEGRATION_MODE": "genie-one",
+            "DATABRICKS_WORKSPACE_ID": "123",
+            "DATABRICKS_GENIE_SPACE_ID": "",
+            "FOUNDRY_CONNECTION_MODE": "existing-oauth",
+        }, clear=True):
+            configuration = load_configuration(self.env_file)
+        self.assertTrue(configuration.genie_mcp_endpoint.endswith("?o=123"))
+
+    def test_rejects_invalid_modes_and_conditional_parameters(self) -> None:
+        cases = [
+            ({"DATABRICKS_INTEGRATION_MODE": "other"}, "INTEGRATION_MODE"),
+            ({"DATABRICKS_INTEGRATION_MODE": ""}, "INTEGRATION_MODE"),
+            ({"FOUNDRY_CONNECTION_MODE": "pat"}, "CONNECTION_MODE"),
+            ({"DATABRICKS_GENIE_SPACE_ID": ""}, "GENIE_SPACE_ID"),
+            ({"DATABRICKS_WORKSPACE_ID": "123"}, "unused"),
+            ({"DATABRICKS_INTEGRATION_MODE": "genie-one"}, "WORKSPACE_ID"),
+        ]
+        one = {
+            "DATABRICKS_INTEGRATION_MODE": "genie-one",
+            "DATABRICKS_GENIE_SPACE_ID": "",
+            "DATABRICKS_WORKSPACE_ID": "123",
+            "FOUNDRY_CONNECTION_MODE": "existing-oauth",
+        }
+        for value in ("0", "-1", "1.5", "12&other=1", "<workspace-id>", "abc"):
+            cases.append(({**one, "DATABRICKS_WORKSPACE_ID": value}, "WORKSPACE_ID"))
+        cases.extend([
+            ({**one, "DATABRICKS_GENIE_SPACE_ID": "old-space"}, "not scoped"),
+            ({**one, "FOUNDRY_CONNECTION_MODE": "managed-oauth"}, "unverified"),
+        ])
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides):
+                with patch.dict(os.environ, overrides, clear=True):
+                    with self.assertRaisesRegex(ConfigurationError, message):
+                        load_configuration(self.env_file)
+
+    def test_rejects_unsafe_workspace_urls_without_echoing_value(self) -> None:
+        for host in (
+            "http://example.azuredatabricks.net",
+            "https://user:password@example.azuredatabricks.net",
+            "https://example.azuredatabricks.net?token=sensitive",
+            "https://example.azuredatabricks.net#fragment",
+            "https://example.azuredatabricks.net:invalid",
+            "https://example.azuredatabricks.net:99999",
+            "https://example.azuredatabricks.net\\other",
+            "https://example.azure\tdatabricks.net",
+            "https://[invalid",
+        ):
+            with self.subTest(host=host), patch.dict(
+                os.environ, {"DATABRICKS_WORKSPACE_HOST": host}, clear=True
+            ):
+                with self.assertRaises(ConfigurationError) as caught:
+                    load_configuration(self.env_file)
+                self.assertNotIn(host, str(caught.exception))
+
+    def test_rejects_empty_or_nested_project_name(self) -> None:
+        for path in ("/api/projects/", "/api/projects/demo/other", "/other/api/projects/demo"):
+            with patch.dict(os.environ, {
+                "FOUNDRY_PROJECT_ENDPOINT": "https://example.services.ai.azure.com" + path
+            }, clear=True):
+                with self.assertRaises(ConfigurationError):
+                    load_configuration(self.env_file)
+
+    def test_missing_file_and_malformed_file_are_explicit_errors(self) -> None:
+        with self.assertRaisesRegex(ConfigurationError, "not found"):
+            load_configuration(self.env_file.with_name("missing.env"))
+        self.env_file.write_text("invalid line", encoding="utf-8")
+        with self.assertRaisesRegex(ConfigurationError, "expected NAME=VALUE"):
+            load_configuration(self.env_file)
+
+    def test_utf8_bom_configuration_and_json_are_supported(self) -> None:
+        self.env_file.write_text(VALID_ENV, encoding="utf-8-sig")
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(load_configuration(self.env_file).foundry_connection_name, "databricks-genie")
+        state = Path(self.temp_directory.name) / "toolbox.json"
+        state.write_text('{"connections":[{"name":"databricks-genie"}]}', encoding="utf-8-sig")
+        self.assertEqual(main([
+            "assert-toolbox-connections", "--input", str(state),
+            "--expected-name", "databricks-genie",
+        ]), 0)
 
     def test_rejects_placeholder_values(self) -> None:
         self.env_file.write_text(
